@@ -23,8 +23,8 @@ build/
 # Expo / React Native
 .expo/
 .expo-shared/
-ohana-mobile/static-build/
-ohana-mobile/dist/
+greece-mobile/static-build/
+greece-mobile/dist/
 *.hprof
 
 # ── Logs ──────────────────────────────────────────────────────
