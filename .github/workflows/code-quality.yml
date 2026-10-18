@@ -23,7 +23,7 @@ jobs:
       - name: Backend Type Check
         run: |
           cd api-server
-          npm ci --legacy-peer-deps
+          npm install --legacy-peer-deps
           npm run typecheck
         continue-on-error: true
       
@@ -49,6 +49,6 @@ jobs:
       - name: Frontend Type Check
         run: |
           cd greece
-          npm ci
+          npm install --legacy-peer-deps
           npm run typecheck
         continue-on-error: true
