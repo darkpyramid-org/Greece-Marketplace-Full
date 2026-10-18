@@ -4,6 +4,7 @@ import router from "./routes";
 import { logger } from "./lib/logger";
 import { corsConfig, errorHandler, requestLogger, securityHeaders } from "./middlewares";
 import { swaggerConfig } from "./lib/swagger";
+import webhooksRouter from "./routes/webhooks";
 
 const app: Express = express();
 
@@ -39,6 +40,14 @@ app.use(securityHeaders);
 
 // CORS middleware
 app.use(corsConfig);
+
+// Stripe webhooks need the raw body for signature verification.
+// Mount before express.json() so the payload is not pre-parsed.
+app.use(
+  "/api/webhooks",
+  express.raw({ type: "application/json", limit: "100kb" }),
+  webhooksRouter,
+);
 
 // Body parsing middleware.
 // The explicit size cap matters: `express.json()` defaults to 100kb, but an

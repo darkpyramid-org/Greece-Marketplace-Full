@@ -7,10 +7,10 @@
     "url": "https://www.darkpyramid.net"
   },
   "scripts": {
-    "install:all": "npm ci && cd api-server && npm ci && cd ../greece && npm ci"
+    "install:all": "npm ci && cd api-server && npm ci --legacy-peer-deps && cd ../greece && npm ci && cd ../greece-mobile && (npm ci || pnpm install || true)",
+    "install:web": "cd api-server && npm ci --legacy-peer-deps && cd ../greece && npm ci",
+    "install:mobile": "cd greece-mobile && (npm ci || pnpm install)"
   },
   "description": "Monorepo for Greece Hieroglyphs: Fullstack deployed on Vercel. Built with Dark Pyramid.",
   "dependencies": {}
 }
-
-

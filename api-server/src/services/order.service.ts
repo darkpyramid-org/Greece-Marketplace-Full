@@ -13,7 +13,7 @@ import { generateOrderId } from "../lib/id-generator";
 import { validateEmail, normalizeName } from "../lib/string-utils";
 import { assertAllowedRedirect } from "../lib/url-guard";
 import { cache, CacheKeys, CacheTTL } from "../lib/cache";
-import { env } from "../lib/env";
+import { env, isStripeConfigured } from "../lib/env";
 import { logger } from "../lib/logger";
 import type {
   CartItem,
@@ -36,13 +36,6 @@ function serviceUnavailable(message: string): Error {
   return Object.assign(new Error(message), { statusCode: 503 });
 }
 
-/**
- * Fill in a complete, persisted shipping address.
- *
- * `shipping_address` is a NOT NULL column, and older clients (the Expo app
- * before its pre-checkout form) still omit the field entirely, so a normalised
- * placeholder is substituted rather than failing the insert.
- */
 function normaliseShippingAddress(
   address: CheckoutBody["shippingAddress"],
   customerEmail: string,
@@ -60,13 +53,6 @@ function normaliseShippingAddress(
   };
 }
 
-/**
- * Rebuild cart items using authoritative catalog data.
- *
- * For every requested line we look the product up by id and then by slug and
- * take the price, name and image from the database. This closes the price
- * tampering hole where a client could POST `price: 1` and have it charged.
- */
 async function resolvePricedItems(
   requested: CheckoutBody["items"],
 ): Promise<CartItem[]> {
@@ -83,8 +69,6 @@ async function resolvePricedItems(
         throw badRequest(`Unknown product: ${lookupId}`);
       }
 
-      // Demo mode (no database attached): fall back to the client-supplied price
-      // so the storefront can still be walked through end to end.
       logger.warn({ lookupId }, "Catalog lookup failed; trusting client price (ALLOW_UNVERIFIED_PRICES)");
       resolved.push({
         product: {
@@ -137,14 +121,7 @@ function calculateShipping(subtotal: number): number {
 }
 
 export const orderService = {
-  /**
-   * `data` is the output of `checkoutBodySchema` (see `validateRequest`), so it
-   * is already shape-checked; the remaining work is normalisation plus the
-   * security-sensitive steps: re-pricing against the catalog and validating the
-   * redirect targets.
-   */
   async createCheckout(body: CheckoutBody): Promise<CheckoutResponse> {
-    // Validate and normalize input data
     const normalizedEmail = validateEmail(body.customerEmail);
     const normalizedName = normalizeName(body.customerName);
     const shippingAddress = normaliseShippingAddress(
@@ -153,17 +130,28 @@ export const orderService = {
       normalizedName,
     );
 
-    // Never hand an arbitrary URL to Stripe — that is an open redirect.
+    // Production hard requirements: never accept unpaid/mock orders or
+    // silently drop orders into process memory on a multi-instance deploy.
+    if (env.isProduction) {
+      if (!isStripeConfigured()) {
+        throw serviceUnavailable(
+          "Payments are not configured. Checkout is disabled until STRIPE_SECRET_KEY is set.",
+        );
+      }
+      if (!env.databaseUrl) {
+        throw serviceUnavailable(
+          "Database is not configured. Checkout is disabled until DATABASE_URL is set.",
+        );
+      }
+    }
+
     const successUrl = assertAllowedRedirect(body.successUrl, "successUrl");
     const cancelUrl = assertAllowedRedirect(body.cancelUrl, "cancelUrl");
 
-    // Re-price every line against the authoritative catalog.
     let items: CartItem[];
     try {
       items = await resolvePricedItems(body.items);
     } catch (err) {
-      // Deliberate 4xx (unknown product, out of stock) propagates untouched; a
-      // dead database must not be reported to the customer as a bad request.
       if (isClientError(err)) throw err;
       logger.error({ err }, "Catalog lookup failed during checkout");
       throw serviceUnavailable(
@@ -203,15 +191,13 @@ export const orderService = {
           quantity: item.quantity,
         }));
 
-        // Fold the flat shipping fee into the session as its own line item so
-        // the amount the customer pays always matches `total`.
         if (shippingCost > 0) {
           lineItems.push({
             price_data: {
               currency: "egp",
               product_data: { name: "Standard shipping" },
               unit_amount: shippingCost,
-          },
+            },
             quantity: 1,
           });
         }
@@ -225,11 +211,6 @@ export const orderService = {
           metadata: { source: "greece", orderId },
         });
       } catch (err) {
-        /**
-         * Previously this fell through to a mock checkout URL, so a real Stripe
-         * outage silently produced an "order" that was never paid for. Surface a
-         * retryable error instead.
-         */
         logger.error({ err }, "Stripe checkout session creation failed");
         throw Object.assign(
           new Error("Payment provider is unavailable. Please try again."),
@@ -248,16 +229,10 @@ export const orderService = {
       sessionId = session.id;
       checkoutUrl = session.url;
     } else {
-      // No Stripe key configured (local/demo): simulate the redirect.
       sessionId = `mock_${orderId}`;
       checkoutUrl = successUrl.replace("{CHECKOUT_SESSION_ID}", sessionId);
     }
 
-    /**
-     * Only the session id is appended. The order total used to be embedded in
-     * the redirect query string, which leaked it into browser history, server
-     * logs, and the `Referer` header of every outbound request.
-     */
     const url = checkoutUrl;
 
     try {
@@ -272,9 +247,14 @@ export const orderService = {
         status: "pending",
       });
 
-      // Invalidate order cache for this email
       cache.invalidatePattern(`orders:email:${normalizedEmail}`);
     } catch (err) {
+      if (env.isProduction) {
+        logger.error({ err }, "Database unavailable during production checkout");
+        throw serviceUnavailable(
+          "Unable to persist order. Please try again shortly.",
+        );
+      }
       logger.warn({ err }, "Database unavailable, storing order in memory");
       inMemoryOrders.push({
         id: orderId,
@@ -298,22 +278,18 @@ export const orderService = {
     const normalisedOrderId = orderId.trim();
     const cacheKey = `${CacheKeys.orders.byId(normalisedOrderId)}:${normalizedEmail}`;
 
-    // Try cache first
     const cached = cache.get<OrderDetails>(cacheKey);
     if (cached) {
       return cached;
     }
 
     try {
-      // Optimized: Try direct lookup by ID first
       let order = await orderQueries.getById(normalisedOrderId);
 
-      // If not found by ID, try by Stripe session ID
       if (!order) {
         order = await orderQueries.getByStripeSessionId(normalisedOrderId);
       }
 
-      // Verify email matches
       if (order && order.customerEmail.toLowerCase() === normalizedEmail) {
         const result = toOrderResponse(order);
         cache.set(cacheKey, result, CacheTTL.orders);
@@ -323,7 +299,6 @@ export const orderService = {
       logger.warn({ err }, "Database unavailable, checking in-memory orders");
     }
 
-    // Fallback to in-memory orders
     const memOrder = inMemoryOrders.find(
       (o) =>
         (o.id === normalisedOrderId || o.stripeSessionId === normalisedOrderId) &&
@@ -340,8 +315,47 @@ export const orderService = {
   },
 
   /**
-   * Invalidate order cache (call after order updates)
+   * Mark an order paid after a verified Stripe webhook and decrement stock.
+   * Idempotent: if the order is already paid, returns without changing stock again.
    */
+  async markPaidFromStripe(stripeSessionId: string): Promise<void> {
+    const order =
+      (await orderQueries.getByStripeSessionId(stripeSessionId).catch(() => undefined)) ??
+      inMemoryOrders.find((o) => o.stripeSessionId === stripeSessionId);
+
+    if (!order) {
+      logger.warn({ stripeSessionId }, "Webhook: order not found for session");
+      return;
+    }
+
+    if (order.status === "paid" || order.status === "fulfilled" || order.status === "shipped") {
+      logger.info({ orderId: order.id }, "Webhook: order already paid — skipping");
+      return;
+    }
+
+    try {
+      await orderQueries.updateStatus(order.id, "paid");
+      const items = order.items as CartItem[];
+      for (const item of items) {
+        const productId = item.product?.id;
+        if (productId) {
+          await productQueries.updateStock(productId, item.quantity);
+        }
+      }
+      this.invalidateCache(order.id, order.customerEmail);
+      logger.info({ orderId: order.id, stripeSessionId }, "Order marked paid; stock decremented");
+    } catch (err) {
+      const mem = inMemoryOrders.find((o) => o.id === order.id);
+      if (mem) {
+        mem.status = "paid";
+        mem.updatedAt = new Date();
+        this.invalidateCache(order.id, order.customerEmail);
+        return;
+      }
+      throw err;
+    }
+  },
+
   invalidateCache(orderId?: string, email?: string): void {
     if (orderId) {
       cache.invalidatePattern(`orders:id:${orderId}`);
@@ -352,11 +366,6 @@ export const orderService = {
   },
 };
 
-/**
- * True when an error was raised deliberately for a bad client request, i.e. it
- * already carries a 4xx `statusCode`. Everything else is treated as an
- * infrastructure failure.
- */
 function isClientError(err: unknown): boolean {
   const statusCode = (err as { statusCode?: number } | null)?.statusCode;
   return typeof statusCode === "number" && statusCode >= 400 && statusCode < 500;

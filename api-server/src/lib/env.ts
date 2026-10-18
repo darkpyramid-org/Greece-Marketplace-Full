@@ -28,6 +28,8 @@ export const env = {
   // Stripe
   stripeSecretKey: process.env.STRIPE_SECRET_KEY,
   stripePublishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
+  /** Required in production when Stripe is configured — verifies webhook signatures. */
+  stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
 
   // CORS
   corsOrigin: process.env.CORS_ORIGIN || "http://localhost:5173",
@@ -52,8 +54,15 @@ export const env = {
    * fallback with no database attached. It is force-disabled in production and
    * must never be enabled there: it would let anyone check out at EGP 0.01.
    */
-  allowUnverifiedPrices: parseBoolean(process.env.ALLOW_UNVERIFIED_PRICES) && nodeEnv !== "production",
+  allowUnverifiedPrices:
+    parseBoolean(process.env.ALLOW_UNVERIFIED_PRICES) && nodeEnv !== "production",
 };
+
+/** True when a usable Stripe secret key is present. */
+export function isStripeConfigured(): boolean {
+  const key = env.stripeSecretKey;
+  return !!key && key.startsWith("sk_");
+}
 
 export const isProduction = env.isProduction;
 export const isDevelopment = env.isDevelopment;
